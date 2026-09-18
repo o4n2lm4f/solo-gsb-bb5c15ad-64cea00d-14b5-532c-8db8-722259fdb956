@@ -22,6 +22,11 @@ local working hours.
 - `/alarms` expands `VALARM` reminders for every instance in a window:
   a master event's alarms apply to each recurring instance, overrides
   carry their own, and `REPEAT`/`DURATION` fan alarms out
+- `/attendance` reports the effective `ATTENDEE` list of every instance in
+  a window: recurring instances inherit the master's attendees, an override
+  declaring any `ATTENDEE` replaces the whole group, and responses are
+  normalized (`PARTSTAT`/`ROLE` defaults, `mailto:` stripping) and counted
+  per `PARTSTAT`
 - Results sorted by UTC start time, then `UID` (stable)
 - Clear `422` errors for invalid rules, unknown timezones, or bad input
 
@@ -499,6 +504,134 @@ after the initial trigger:
 }
 ```
 
+### `POST /attendance`
+
+Reports the effective `ATTENDEE` list of every `VEVENT` instance that
+overlaps the query window. Request body is the same shape as `/expand`:
+
+| Field          | Type   | Description                                        |
+| -------------- | ------ | -------------------------------------------------- |
+| `ics`          | string | iCalendar text (one or more `VEVENT`s)             |
+| `window_start` | string | ISO 8601 timestamp, converted to UTC (naive = UTC) |
+| `window_end`   | string | ISO 8601 timestamp, converted to UTC (naive = UTC) |
+
+Attendance semantics:
+
+- A **master** event's `ATTENDEE` list applies to *every* expanded
+  instance of the series. A `RECURRENCE-ID` override that declares at
+  least one `ATTENDEE` **replaces** the master's whole group for that
+  instance; an override without any `ATTENDEE` inherits the master's
+  group unchanged. (The effective list is always exactly one event's
+  declared list — never a merge.)
+- Addresses are normalized: a `mailto:` prefix (any letter case) is
+  stripped and the address lowercased (`MAILTO:Alice@Example.COM` →
+  `alice@example.com`); any other URI is kept verbatim.
+- `PARTSTAT` defaults to `NEEDS-ACTION` and `ROLE` to `REQ-PARTICIPANT`;
+  both are uppercased.
+- Within one effective list, the same address declared twice collapses to
+  a single entry when the (normalized) `PARTSTAT`/`ROLE` agree, and fails
+  the request with `422` when they conflict. Every `VEVENT`'s declared
+  list is validated eagerly, so a conflict yields `422` even when the
+  event has no instance inside the window.
+- Each instance carries `uid`, `recurrence_id` (UTC, `null` for
+  non-recurring events), `start`, `end`, `counts` (a map of `PARTSTAT` →
+  number of attendees, keys sorted) and `attendees` (sorted by address,
+  each with `address`, `partstat`, `role`). Instances are sorted like
+  `/expand`: by `start`, then `uid`, then `recurrence_id`.
+
+### Example
+
+```bash
+curl -s http://localhost:8000/attendance \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:weekly-1\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\nSUMMARY:Weekly sync\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:alice@example.com\r\nATTENDEE:mailto:bob@example.com\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:weekly-1\r\nRECURRENCE-ID:20260112T090000Z\r\nDTSTART:20260112T110000Z\r\nDTEND:20260112T120000Z\r\nSUMMARY:Weekly sync (moved)\r\nATTENDEE;PARTSTAT=DECLINED:MAILTO:Alice@Example.com\r\nATTENDEE;PARTSTAT=ACCEPTED;ROLE=CHAIR:mailto:carol@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR",
+    "window_start": "2026-01-01T00:00:00Z",
+    "window_end": "2026-02-01T00:00:00Z"
+  }'
+```
+
+The January 5 and 19 instances inherit the master's group (Bob gets the
+`NEEDS-ACTION`/`REQ-PARTICIPANT` defaults). The moved January 12 instance
+replaces the whole group with the override's own list — note
+`MAILTO:Alice@Example.com` normalized to `alice@example.com`:
+
+```json
+{
+  "window_start": "2026-01-01T00:00:00Z",
+  "window_end": "2026-02-01T00:00:00Z",
+  "count": 3,
+  "instances": [
+    {
+      "uid": "weekly-1",
+      "recurrence_id": "2026-01-05T09:00:00Z",
+      "start": "2026-01-05T09:00:00Z",
+      "end": "2026-01-05T10:00:00Z",
+      "counts": {
+        "ACCEPTED": 1,
+        "NEEDS-ACTION": 1
+      },
+      "attendees": [
+        {
+          "address": "alice@example.com",
+          "partstat": "ACCEPTED",
+          "role": "REQ-PARTICIPANT"
+        },
+        {
+          "address": "bob@example.com",
+          "partstat": "NEEDS-ACTION",
+          "role": "REQ-PARTICIPANT"
+        }
+      ]
+    },
+    {
+      "uid": "weekly-1",
+      "recurrence_id": "2026-01-12T09:00:00Z",
+      "start": "2026-01-12T11:00:00Z",
+      "end": "2026-01-12T12:00:00Z",
+      "counts": {
+        "ACCEPTED": 1,
+        "DECLINED": 1
+      },
+      "attendees": [
+        {
+          "address": "alice@example.com",
+          "partstat": "DECLINED",
+          "role": "REQ-PARTICIPANT"
+        },
+        {
+          "address": "carol@example.com",
+          "partstat": "ACCEPTED",
+          "role": "CHAIR"
+        }
+      ]
+    },
+    {
+      "uid": "weekly-1",
+      "recurrence_id": "2026-01-19T09:00:00Z",
+      "start": "2026-01-19T09:00:00Z",
+      "end": "2026-01-19T10:00:00Z",
+      "counts": {
+        "ACCEPTED": 1,
+        "NEEDS-ACTION": 1
+      },
+      "attendees": [
+        {
+          "address": "alice@example.com",
+          "partstat": "ACCEPTED",
+          "role": "REQ-PARTICIPANT"
+        },
+        {
+          "address": "bob@example.com",
+          "partstat": "NEEDS-ACTION",
+          "role": "REQ-PARTICIPANT"
+        }
+      ]
+    }
+  ]
+}
+```
+
 ### Errors (`422 Unprocessable Entity`)
 
 Returned with a descriptive `detail` message for: unparsable iCalendar
@@ -532,6 +665,13 @@ beyond 1000 reminders, or an unknown `TZID` on an absolute trigger. All
 even when its trigger lies outside the window; calendar-level failures
 (unparsable ICS, bad window, invalid recurrence) reuse the `/expand`
 checks.
+
+`/attendance` additionally returns `422` when one `VEVENT` declares the
+same normalized address twice with conflicting `PARTSTAT` or `ROLE`
+(identical re-declarations collapse instead). All `VEVENT`s' `ATTENDEE`
+lists are validated eagerly, so a conflict yields `422` even when the
+event has no instance inside the window; calendar-level failures reuse
+the `/expand` checks.
 
 ## Semantics and limitations
 
@@ -568,6 +708,26 @@ checks.
   validated regardless of whether its event or trigger intersects the
   window; an unsupported or malformed alarm fails the whole request with
   `422`. Events without any `VALARM` simply contribute no reminders.
+
+### Attendance semantics
+
+- **Effective list**: a master `VEVENT`'s `ATTENDEE`s apply to every
+  instance the recurrence engine expands from it; a `RECURRENCE-ID`
+  override declaring at least one `ATTENDEE` replaces the master's whole
+  group for that instance, while an override without `ATTENDEE`s inherits
+  the group unchanged. Cancelled instances and `EXDATE`d occurrences
+  produce no output.
+- **Normalization**: `mailto:` addresses are stripped of the prefix (any
+  letter case) and lowercased; other URIs are kept verbatim. `PARTSTAT`
+  and `ROLE` are uppercased and default to `NEEDS-ACTION` and
+  `REQ-PARTICIPANT`.
+- **Duplicates**: within one effective list, a repeated address with
+  identical (normalized) `PARTSTAT`/`ROLE` collapses to one entry; a
+  conflict fails the whole request with `422`. Validation is eager, like
+  the alarms endpoint.
+- **Output**: `counts` aggregates the effective list by `PARTSTAT`;
+  `attendees` is sorted by address and instances follow the `/expand`
+  ordering (`start`, then `uid`, then `recurrence_id`).
 
 ### Availability semantics
 
@@ -629,10 +789,11 @@ uvicorn app.main:app --reload       # run locally on port 8000
 
 ```
 app/main.py          FastAPI app: POST /expand, POST /alarms,
-                     POST /calendar-diff, POST /availability,
-                     POST /conflicts, GET /health
+                     POST /attendance, POST /calendar-diff,
+                     POST /availability, POST /conflicts, GET /health
 app/expander.py      recurrence expansion, override merging, TZ/DST handling
 app/alarms.py        VALARM parsing, REPEAT/DURATION fan-out, window filtering
+app/attendance.py    ATTENDEE inheritance, normalization, PARTSTAT counts
 app/diff.py          two-calendar instance diff by UID + RECURRENCE-ID
 app/availability.py  working-period timeline, busy clipping/merge, free complement
 app/conflicts.py     half-open sweep for minimum-concurrency segments

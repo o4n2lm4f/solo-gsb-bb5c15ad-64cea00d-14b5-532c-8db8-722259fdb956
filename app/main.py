@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_serializer, model_validator
 
 from .alarms import AlarmError, Reminder, expand_alarms
+from .attendance import AttendanceError, InstanceAttendance, expand_attendance
 from .availability import (
     WEEKDAY_NAMES,
     AvailabilityError,
@@ -24,12 +25,13 @@ UTC = dt.timezone.utc
 
 app = FastAPI(
     title="iCalendar Recurrence Expansion and Availability API",
-    version="1.4.0",
+    version="1.5.0",
     summary="Expand DTSTART/RRULE/RDATE/EXDATE and RECURRENCE-ID overrides "
     "into concrete UTC instances, intersect named calendars with "
     "local working hours to find common free time, find high-concurrency "
-    "segments across named calendars, and expand VALARM reminders for the "
-    "instances inside a query window.",
+    "segments across named calendars, expand VALARM reminders for the "
+    "instances inside a query window, and report per-instance ATTENDEE "
+    "responses with PARTSTAT counts.",
 )
 
 
@@ -111,6 +113,51 @@ class AlarmsResponse(BaseModel):
     window_end: dt.datetime
     count: int
     alarms: list[AlarmOut]
+
+    @field_serializer("window_start", "window_end")
+    def _serialize_window(self, value: dt.datetime) -> str:
+        return _iso_z(value)
+
+
+# ---------------------------------------------------------------------------
+# POST /attendance
+# ---------------------------------------------------------------------------
+
+
+class AttendanceRequest(BaseModel):
+    ics: str = Field(..., description="iCalendar (RFC 5545) text to scan for attendees")
+    window_start: dt.datetime = Field(
+        ..., description="Start of the query window (ISO 8601, converted to UTC)"
+    )
+    window_end: dt.datetime = Field(
+        ..., description="End of the query window (ISO 8601, converted to UTC)"
+    )
+
+
+class AttendeeOut(BaseModel):
+    address: str
+    partstat: str
+    role: str
+
+
+class AttendanceInstanceOut(BaseModel):
+    uid: str
+    recurrence_id: dt.datetime | None
+    start: dt.datetime
+    end: dt.datetime
+    counts: dict[str, int]
+    attendees: list[AttendeeOut]
+
+    @field_serializer("recurrence_id", "start", "end")
+    def _serialize_dt(self, value: dt.datetime | None) -> str | None:
+        return _iso_z(value)
+
+
+class AttendanceResponse(BaseModel):
+    window_start: dt.datetime
+    window_end: dt.datetime
+    count: int
+    instances: list[AttendanceInstanceOut]
 
     @field_serializer("window_start", "window_end")
     def _serialize_window(self, value: dt.datetime) -> str:
@@ -287,6 +334,24 @@ def _alarm_out(reminder: Reminder) -> AlarmOut:
     )
 
 
+def _attendance_out(entry: InstanceAttendance) -> AttendanceInstanceOut:
+    return AttendanceInstanceOut(
+        uid=entry.uid,
+        recurrence_id=entry.recurrence_id,
+        start=entry.start,
+        end=entry.end,
+        counts=entry.counts,
+        attendees=[
+            AttendeeOut(
+                address=attendee.address,
+                partstat=attendee.partstat,
+                role=attendee.role,
+            )
+            for attendee in entry.attendees
+        ],
+    )
+
+
 def _participant_out(participant: Participant) -> ParticipantOut:
     return ParticipantOut(
         calendar=participant.calendar,
@@ -376,6 +441,26 @@ def alarms(request: AlarmsRequest) -> AlarmsResponse:
         window_end=window_end,
         count=len(reminders),
         alarms=[_alarm_out(r) for r in reminders],
+    )
+
+
+@app.post("/attendance", response_model=AttendanceResponse)
+def attendance(request: AttendanceRequest) -> AttendanceResponse:
+    window_start = _to_utc(request.window_start)
+    window_end = _to_utc(request.window_end)
+    if window_start >= window_end:
+        raise HTTPException(
+            status_code=422, detail="window_start must be before window_end"
+        )
+    try:
+        entries = expand_attendance(request.ics, window_start, window_end)
+    except (ExpansionError, AttendanceError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return AttendanceResponse(
+        window_start=window_start,
+        window_end=window_end,
+        count=len(entries),
+        instances=[_attendance_out(e) for e in entries],
     )
 
 
