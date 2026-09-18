@@ -39,6 +39,11 @@ class Instance:
     # this instance: a master's alarms apply to every recurring instance,
     # while a RECURRENCE-ID override uses only its own (possibly empty).
     alarms: list = field(default_factory=list)
+    # Raw icalendar ATTENDEE properties in effect for this instance. A
+    # recurring instance inherits the master's attendees; a RECURRENCE-ID
+    # override that declares any ATTENDEE replaces the whole list (an
+    # override without ATTENDEE keeps inheriting the master's).
+    attendees: list = field(default_factory=list)
 
 
 def expand_calendar(
@@ -89,6 +94,7 @@ def _expand_group(
     instances: dict[dt.datetime, Instance] = {}
     master_summary: str | None = None
     master_duration: dt.timedelta | None = None
+    master_attendees: list = []
 
     if masters:
         master = masters[0]
@@ -96,6 +102,7 @@ def _expand_group(
         m_start, m_end = _event_times(master)
         master_duration = m_end - m_start
         master_alarms = [c for c in master.subcomponents if c.name == "VALARM"]
+        master_attendees = _props(master, "ATTENDEE")
         if _status(master) != "CANCELLED":
             occurrences, recurring = _expand_master(
                 master, m_start, master_duration, window_start, window_end
@@ -110,6 +117,7 @@ def _expand_group(
                     summary=master_summary,
                     status=_status(master),
                     alarms=master_alarms,
+                    attendees=master_attendees,
                 )
 
     for override in overrides:
@@ -122,6 +130,7 @@ def _expand_group(
             continue
         start, end = _event_times(override, default_duration=master_duration)
         summary = _text(override, "SUMMARY")
+        override_attendees = _props(override, "ATTENDEE")
         instances[rid] = Instance(
             uid=uid,
             recurrence_id=rid,
@@ -130,6 +139,9 @@ def _expand_group(
             summary=summary if summary is not None else master_summary,
             status=status,
             alarms=[c for c in override.subcomponents if c.name == "VALARM"],
+            # An override declaring any ATTENDEE replaces the master's list
+            # wholesale; one without keeps inheriting the master's.
+            attendees=override_attendees if override_attendees else master_attendees,
         )
 
     return list(instances.values())
